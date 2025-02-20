@@ -1,6 +1,12 @@
-import { uploadFileToCloudinary } from "../utils/cloudinary.js";
 import fs from 'fs';
-import { User } from '../models/user.js'
+import { User } from '../models/user.js';
+import { uploadFileToCloudinary } from "../utils/cloudinary.js";
+import jwt from 'jsonwebtoken'
+
+const options = {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production'
+}
 
 export const registerController = async (req, res) => {
     const { username, email, password } = req.body;
@@ -47,5 +53,102 @@ export const registerController = async (req, res) => {
         console.log(error);
         fs.unlinkSync(profile_photo_path)
         fs.unlinkSync(cover_photo_path)
+    }
+}
+
+const generateAccessTokenAndRefreshToken = async (userId) => {
+    const existingUser = await User.findById(userId);
+
+    if (!existingUser) {
+        return res.status(404).json({ message: 'No User Found.' })
+    }
+
+    const accessToken = await existingUser.generateAccessToken();
+    const refreshToken = await existingUser.generateRefreshToken();
+
+    existingUser.refresh_token = refreshToken;
+    await existingUser.save({ validateBeforeSave: false });
+
+    return { accessToken, refreshToken }
+}
+
+export const loginController = async (req, res) => {
+    const { username, email, password } = req.body;
+
+    if (!username || !email || !password) {
+        return res.status(400).json({ message: "All fields are required." })
+    }
+    const existingUser = await User.findOne({
+        $or: [{ username }, { email }]
+    })
+
+    if (!existingUser) {
+        return res.status(400).json({ message: "No user found!" });
+    }
+
+    const isPasswordMatch = await existingUser.isPasswordMatch(password);
+
+    if (!isPasswordMatch) {
+        return res.status(401).json({ message: "Invaild Credentials." });
+    }
+
+    const { accessToken, refreshToken } = await generateAccessTokenAndRefreshToken(existingUser._id);
+
+    const loggedInUser = await User.findById(existingUser._id).select("-password -refresh_token");
+    return res.status(200).cookie('accessToken', accessToken, options).cookie('refreshToken', refreshToken, options).
+        json({ userInfo: loggedInUser, message: 'Login success.' })
+}
+
+// run if token expire 
+export const generateNewRefreshToken = async (req, res) => {
+    const incomingRefreshToken = req.cookies.refreshToken || req.body.refreshToken;
+
+    if (!incomingRefreshToken) {
+        return res.status(404).json({ message: 'No Token Found' })
+    }
+
+    try {
+        const decodedToken = jwt.verify(incomingRefreshToken, process.env.REFRESHTOKEN_SECRET_KEY);
+        const existingUser = await User.findById(decodedToken?._id);
+
+        if (!existingUser) {
+            return res.status(404).json({ message: 'No User Found' })
+        }
+
+        if (incomingRefreshToken !== existingUser.refresh_token) {
+            return res.status(401).json({ message: 'Invalid Refresh Token' })
+        }
+
+        const { accessToken, refreshToken } = await generateAccessTokenAndRefreshToken(existingUser._id);        
+
+        return res.status(200).cookie('accessToken', accessToken, options).cookie('refreshToken', refreshToken, options).
+            json({ message: 'Token Updated.' })
+    } catch (error) {
+        console.log('new refreshtoken error',error);
+        return res.status(500).json({ message: 'Something went wrong' })
+    }
+}
+
+export const logoutController = async (req, res) => {
+    console.log(req.user);
+
+    if (!req.user || !req.user._id) {
+        return res.status(404).json({ message: 'No User Found' })
+    }
+
+    try {
+        await User.findByIdAndUpdate(req.user._id, {
+            $unset: {
+                refresh_token: 1
+            }
+        },
+            { new: true }
+        );
+        return res.status(200).clearCookie('accessToken', options).clearCookie('refreshToken', options).
+            json({ message: `${req.user.username} logout successfully.` })
+
+    } catch (error) {
+        console.log('logout error',error);
+        return res.status(500).json({ message: 'Something went wrong' })
     }
 }
